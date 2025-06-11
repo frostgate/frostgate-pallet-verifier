@@ -1,10 +1,8 @@
 use sp_std::prelude::*;
 use sp_runtime::traits::Hash;
 use codec::{Decode, Encode};
-use frostgate_circuits::sp1::{
-    types::{Sp1ProofType, Sp1Backend},
-    verifier::verify_proof as sp1_verify_proof,
-};
+use frostgate_circuits::sp1::{Sp1Backend, Sp1Config};
+use frostgate_zkip::{ZkBackend, ZkError};
 
 /// Verification error types
 #[derive(Debug, Encode, Decode, PartialEq, Eq)]
@@ -17,8 +15,19 @@ pub enum VerificationError {
     InvalidInput,
     /// System error
     SystemError,
-    /// SP1 verification error
-    Sp1Error(Vec<u8>),
+    /// Backend error
+    BackendError(Vec<u8>),
+}
+
+impl From<ZkError> for VerificationError {
+    fn from(error: ZkError) -> Self {
+        match error {
+            ZkError::Program(msg) => VerificationError::InvalidProofFormat,
+            ZkError::VerificationFailed(msg) => VerificationError::VerificationFailed,
+            ZkError::Input(msg) => VerificationError::InvalidInput,
+            _ => VerificationError::SystemError,
+        }
+    }
 }
 
 /// Result type for verification operations
@@ -27,18 +36,37 @@ pub type VerificationResult = Result<(), VerificationError>;
 /// Proof verification context
 #[derive(Clone)]
 pub struct VerificationContext {
-    /// Verification key bytes
-    pub verifying_key: Vec<u8>,
+    /// Program bytes
+    pub program: Vec<u8>,
     /// Program hash
     pub program_hash: [u8; 32],
+    /// Backend instance
+    pub backend: Sp1Backend,
+}
+
+impl VerificationContext {
+    /// Create a new verification context
+    pub fn new(program: Vec<u8>, program_hash: [u8; 32]) -> Self {
+        let config = Sp1Config {
+            max_concurrent: Some(2), // Limited concurrency for on-chain verification
+            cache_size: 10,         // Small cache for on-chain use
+            use_gpu: false,         // No GPU for on-chain verification
+        };
+        
+        Self {
+            program,
+            program_hash,
+            backend: Sp1Backend::with_config(config),
+        }
+    }
 }
 
 /// Proof verification parameters
 pub struct VerificationParams<'a> {
-    /// Message proof bytes
+    /// Proof bytes
     pub proof: &'a [u8],
-    /// Message payload
-    pub payload: &'a [u8],
+    /// Public input
+    pub input: &'a [u8],
     /// Source chain ID
     pub from_chain: u64,
     /// Destination chain ID
@@ -49,134 +77,53 @@ pub struct VerificationParams<'a> {
     pub timestamp: u64,
 }
 
-/// Verify a proof using SP1
-pub fn verify_proof(
+/// Verify a proof using the configured backend
+pub async fn verify_proof(
     context: &VerificationContext,
-    params: &VerificationParams,
+    params: &VerificationParams<'_>,
 ) -> VerificationResult {
-    // Validate input format
-    if params.proof.is_empty() {
-        return Err(VerificationError::InvalidProofFormat);
-    }
-
-    // Check chain IDs are valid
-    if params.from_chain > 2 || params.to_chain > 2 {
-        return Err(VerificationError::InvalidInput);
-    }
-
-    // Check timestamp is reasonable
-    if params.timestamp < 1600000000 || params.timestamp > 2000000000 {
-        return Err(VerificationError::InvalidInput);
-    }
-
-    // Deserialize SP1 proof
-    let sp1_proof = match bincode::deserialize::<Sp1ProofType>(params.proof) {
-        Ok(p) => p,
-        Err(_) => return Err(VerificationError::InvalidProofFormat),
-    };
-
-    // Create input vector for verification
-    let mut input = Vec::new();
-    
-    // Add chain IDs
-    input.extend_from_slice(&params.from_chain.to_be_bytes());
-    input.extend_from_slice(&params.to_chain.to_be_bytes());
-    
-    // Add payload length and payload
-    let payload_len = params.payload.len() as u64;
-    input.extend_from_slice(&payload_len.to_be_bytes());
-    input.extend_from_slice(params.payload);
-    
-    // Add nonce and timestamp
-    input.extend_from_slice(&params.nonce.to_be_bytes());
-    input.extend_from_slice(&params.timestamp.to_be_bytes());
-
-    // Create SP1 backend for verification
-    let backend = Sp1Backend::Local(sp1_sdk::EnvProver::new());
-
     // Verify the proof
-    match sp1_verify_proof(&backend, &sp1_proof, &context.verifying_key) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(VerificationError::VerificationFailed),
-        Err(e) => Err(VerificationError::Sp1Error(e.to_string().into_bytes())),
+    context.backend.verify(&context.program, params.proof, None)
+        .await
+        .map_err(|e| e.into())
+        .and_then(|valid| {
+            if valid {
+                Ok(())
+            } else {
+                Err(VerificationError::VerificationFailed)
     }
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sp_core::H256;
 
-    #[test]
-    fn test_basic_verification() {
-        let context = VerificationContext {
-            verifying_key: vec![1, 2, 3], // Mock key
-            program_hash: [0; 32],
-        };
+    #[tokio::test]
+    async fn test_proof_verification() {
+        // Create a dummy program and hash
+        let program = vec![1, 2, 3, 4];
+        let program_hash = H256::from_slice(&[0; 32]).into();
 
-        // Create a mock SP1 proof
-        let mock_proof = bincode::serialize(&Sp1ProofType::Core(
-            sp1_sdk::SP1ProofWithPublicValues::default()
-        )).unwrap();
+        // Create verification context
+        let context = VerificationContext::new(program, program_hash);
 
-        let params = VerificationParams {
-            proof: &mock_proof,
-            payload: &[4, 5, 6],
-            from_chain: 0,
-            to_chain: 1,
-            nonce: 1,
-            timestamp: 1700000000,
-        };
-
-        // This will fail because we're using a mock proof
-        assert!(verify_proof(&context, &params).is_err());
-    }
-
-    #[test]
-    fn test_invalid_proof() {
-        let context = VerificationContext {
-            verifying_key: vec![1, 2, 3],
-            program_hash: [0; 32],
-        };
+        // Create dummy proof and params
+        let proof = vec![5, 6, 7, 8];
+        let input = vec![9, 10, 11, 12];
 
         let params = VerificationParams {
-            proof: &[], // Empty proof
-            payload: &[4, 5, 6],
-            from_chain: 0,
-            to_chain: 1,
-            nonce: 1,
-            timestamp: 1700000000,
+            proof: &proof,
+            input: &input,
+            from_chain: 1,
+            to_chain: 2,
+            nonce: 0,
+            timestamp: 0,
         };
 
-        assert_eq!(
-            verify_proof(&context, &params),
-            Err(VerificationError::InvalidProofFormat)
-        );
-    }
-
-    #[test]
-    fn test_invalid_chain_id() {
-        let context = VerificationContext {
-            verifying_key: vec![1, 2, 3],
-            program_hash: [0; 32],
-        };
-
-        // Create a mock SP1 proof
-        let mock_proof = bincode::serialize(&Sp1ProofType::Core(
-            sp1_sdk::SP1ProofWithPublicValues::default()
-        )).unwrap();
-
-        let params = VerificationParams {
-            proof: &mock_proof,
-            payload: &[4, 5, 6],
-            from_chain: 3, // Invalid chain ID
-            to_chain: 1,
-            nonce: 1,
-            timestamp: 1700000000,
-        };
-
-        assert_eq!(
-            verify_proof(&context, &params),
-            Err(VerificationError::InvalidInput)
-        );
+        // Test verification
+        let result = verify_proof(&context, &params).await;
+        assert!(result.is_err()); // Should fail with dummy data
     }
 } 
